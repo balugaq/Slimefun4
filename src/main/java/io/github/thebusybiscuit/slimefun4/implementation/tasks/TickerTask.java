@@ -93,7 +93,7 @@ public class TickerTask implements Runnable {
     private final Deque<WaitingEntry> waiting = new ConcurrentLinkedDeque<>();
 
     private final ExecutorService tickExecutor =
-        Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, "Slimefun - Ticker Thread"));
+            Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, "Slimefun - Ticker Thread"));
 
     /**
      * @see #stepTo(WaitingEntry, boolean)
@@ -400,9 +400,11 @@ public class TickerTask implements Runnable {
                 // Bukkit 自带的 Watchdog 会检测超时，不需要我们处理
                 tickBlock(entry);
             } else {
-                CompletableFuture.runAsync(() -> {
-                            tickBlock(entry);
-                        }, tickExecutor)
+                CompletableFuture.runAsync(
+                                () -> {
+                                    tickBlock(entry);
+                                },
+                                tickExecutor)
                         .get(timeout, timeUnit);
             }
         } catch (TimeoutException e) {
