@@ -16,7 +16,6 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -43,6 +42,7 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.TextColor;
 import org.apache.commons.lang.Validate;
+import org.apache.commons.lang.time.StopWatch;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Location;
@@ -93,11 +93,14 @@ public class TickerTask implements Runnable {
 
     private final Deque<WaitingEntry> waiting = new ConcurrentLinkedDeque<>();
 
+    private final ExecutorService tickExecutor =
+        Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, "Slimefun - Ticker Thread"));
+
     /**
      * @see #stepTo(WaitingEntry, boolean)
      */
     private final ExecutorService operateExecutor =
-            Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, "Slimefun - Ticker Operation"));
+            Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, "Slimefun - Ticker Operation Thread"));
 
     /**
      * 防抖
@@ -400,7 +403,7 @@ public class TickerTask implements Runnable {
             } else {
                 CompletableFuture.runAsync(() -> {
                             tickBlock(entry);
-                        })
+                        }, tickExecutor)
                         .get(timeout, timeUnit);
             }
         } catch (TimeoutException e) {
