@@ -16,13 +16,18 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.logging.Level;
@@ -71,6 +76,12 @@ public class TickerTask implements Runnable {
 
     private int count = 0;
 
+    /**
+     * -- GETTER --
+     *  This returns the delay between ticks
+     *
+     * @return The tick delay
+     */
     @Setter
     private int tickRate;
 
@@ -82,13 +93,29 @@ public class TickerTask implements Runnable {
 
     private final Deque<WaitingEntry> waiting = new ConcurrentLinkedDeque<>();
 
+    /**
+     * @see #stepTo(WaitingEntry, boolean)
+     */
+    private final ExecutorService operateExecutor =
+            Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, "Slimefun - Ticker Operation"));
+
+    /**
+     * 防抖
+     * 表示是否有一段步进任务已在 {@link #operateExecutor} 上跑。见 {@link #stepTo}。
+     */
+    private final AtomicBoolean stepping = new AtomicBoolean(false);
+
     private final int PAGE_SIZE = 10;
 
     @Setter
     private volatile boolean tickFreeze = false;
 
-    @Setter
+    // false -> 不暂停， true -> 暂停
     private volatile Predicate<WaitingEntry> tickFreezePredicate = entry -> false;
+
+    public void setTickFreezePredicate(Predicate<WaitingEntry> predicate) {
+        this.tickFreezePredicate = predicate != null ? predicate : entry -> false;
+    }
 
     @Data
     public static class WaitingEntry {
@@ -96,16 +123,13 @@ public class TickerTask implements Runnable {
         private final Location location;
         private final SlimefunItem item;
         private final ASlimefunDataContainer data;
-        private final long timestamp;
         private final boolean sync;
         private final long id;
 
-        public WaitingEntry(
-                Location location, SlimefunItem item, ASlimefunDataContainer data, long timestamp, boolean sync) {
+        public WaitingEntry(Location location, SlimefunItem item, ASlimefunDataContainer data, boolean sync) {
             this.location = location;
             this.item = item;
             this.data = data;
-            this.timestamp = timestamp;
             this.sync = sync;
             this.id = ID.getAndIncrement();
         }
@@ -133,7 +157,7 @@ public class TickerTask implements Runnable {
 
     @Override
     public void run() {
-        if (paused) {
+        if (paused || stepping.get()) { // 步过期间不执行
             return;
         }
 
@@ -147,10 +171,7 @@ public class TickerTask implements Runnable {
         }
         count = 0;
 
-        int length = waiting.size();
-        for (int i = 0; i < length; i++) {
-            timedTickBlock();
-        }
+        flushWaitingEntries(); // 上轮 tick freeze 没执行的
 
         try {
             // If this method is actually still running... DON'T
@@ -171,8 +192,14 @@ public class TickerTask implements Runnable {
                 }
 
                 for (Map.Entry<ChunkPosition, Set<TickLocation>> entry : loc) {
+                    // 将所有机器添加到 waiting queue 中
                     tickChunk(entry.getKey(), tickers, new HashSet<>(entry.getValue()));
                 }
+            }
+
+            // 遍历阶段结束，本轮机器才真正开始执行
+            if (!tickFreeze) {
+                flushWaitingEntries();
             }
 
             // Start a new tick cycle for every BlockTicker
@@ -182,6 +209,7 @@ public class TickerTask implements Runnable {
 
             reset();
             Slimefun.getProfiler().stop();
+
             if (tickFreeze) {
                 showWaitingList();
             }
@@ -193,20 +221,25 @@ public class TickerTask implements Runnable {
                             () -> "An Exception was caught while ticking the Block Tickers Task for Slimefun v"
                                     + Slimefun.getVersion());
             reset();
+
+            int discarded = clearWaitingEntries();
+            if (discarded > 0) {
+                Slimefun.logger().log(Level.SEVERE, "有 " + discarded + " 个机器未能成功 Tick，已从待执行队列丢弃");
+            }
         }
     }
 
     @ParametersAreNonnullByDefault
     private void tickChunk(ChunkPosition chunk, Set<BlockTicker> tickers, Set<TickLocation> locations) {
+        // Only continue if the Chunk is actually loaded
+        if (!chunk.isLoaded()) return;
+
         try {
-            // Only continue if the Chunk is actually loaded
-            if (chunk.isLoaded()) {
-                for (TickLocation l : locations) {
-                    if (l.isUniversal()) {
-                        tickUniversalLocation(l.getUuid(), l.getLocation(), tickers);
-                    } else {
-                        tickLocation(tickers, l.getLocation());
-                    }
+            for (TickLocation l : locations) {
+                if (l.isUniversal()) {
+                    tickUniversalLocation(l.getUuid(), l.getLocation(), tickers);
+                } else {
+                    tickLocation(tickers, l.getLocation());
                 }
             }
         } catch (ArrayIndexOutOfBoundsException | NumberFormatException x) {
@@ -222,28 +255,8 @@ public class TickerTask implements Runnable {
         }
 
         SlimefunItem item = SlimefunItem.getById(blockData.getSfId());
-
-        if (item != null && item.getBlockTicker() != null) {
-            if (item.isDisabledIn(l.getWorld())) {
-                return;
-            }
-
-            try {
-                if (item.getBlockTicker().isSynchronized()) {
-                    Slimefun.getProfiler().scheduleEntries(1);
-                    item.getBlockTicker().update();
-
-                    timedTickBlock(l, item, blockData, System.nanoTime(), true);
-                } else {
-                    long timestamp = Slimefun.getProfiler().newEntry();
-                    item.getBlockTicker().update();
-                    timedTickBlock(l, item, blockData, timestamp, false);
-                }
-
-                tickers.add(item.getBlockTicker());
-            } catch (Exception x) {
-                reportErrors(l, item, x);
-            }
+        if (item != null && item.getBlockTicker() != null && !item.isDisabledIn(l.getWorld())) {
+            enqueueTick(l, item, blockData, tickers);
         }
     }
 
@@ -251,55 +264,26 @@ public class TickerTask implements Runnable {
     private void tickUniversalLocation(UUID uuid, Location l, @Nonnull Set<BlockTicker> tickers) {
         var data = StorageCacheUtils.getUniversalBlock(uuid);
         var item = SlimefunItem.getById(data.getSfId());
-
-        if (item != null && item.getBlockTicker() != null) {
-            if (item.isDisabledIn(l.getWorld())) {
-                return;
-            }
-
-            try {
-                if (item.getBlockTicker().isSynchronized()) {
-                    Slimefun.getProfiler().scheduleEntries(1);
-                    item.getBlockTicker().update();
-
-                    /**
-                     * We are inserting a new timestamp because synchronized actions
-                     * are always ran with a 50ms delay (1 game tick)
-                     */
-                    Slimefun.runSync(() -> {
-                        if (data.isPendingRemove()) {
-                            return;
-                        }
-                        timedTickBlock(l, item, data, System.nanoTime(), true);
-                    });
-                } else {
-                    long timestamp = Slimefun.getProfiler().newEntry();
-                    item.getBlockTicker().update();
-                    timedTickBlock(l, item, data, timestamp, false);
-                }
-
-                tickers.add(item.getBlockTicker());
-            } catch (Exception x) {
-                reportErrors(l, item, x);
-            }
+        if (item != null && item.getBlockTicker() != null && !item.isDisabledIn(l.getWorld())) {
+            enqueueTick(l, item, data, tickers);
         }
     }
 
+    /**
+     * 放入 waiting
+     * 真正的执行在 {@link #flushWaitingEntries()}。
+     */
     @ParametersAreNonnullByDefault
-    private void timedTickBlock(Location l, SlimefunItem item, ASlimefunDataContainer data, long timestamp) {
-        timedTickBlock(l, item, data, timestamp, true); // fallback
-    }
+    private void enqueueTick(Location l, SlimefunItem item, ASlimefunDataContainer data, Set<BlockTicker> tickers) {
+        try {
+            boolean sync = item.getBlockTicker().isSynchronized();
 
-    @ParametersAreNonnullByDefault
-    private void timedTickBlock(
-            Location l, SlimefunItem item, ASlimefunDataContainer data, long timestamp, boolean sync) {
-        var entry = new WaitingEntry(l, item, data, timestamp, sync);
-        waiting.add(entry);
-        if (tickFreezePredicate.test(entry)) {
-            tickFreeze = true;
-        }
-        if (!tickFreeze) {
-            timedTickBlock();
+            item.getBlockTicker().update();
+            waiting.add(new WaitingEntry(l, item, data, sync));
+
+            tickers.add(item.getBlockTicker());
+        } catch (Exception | LinkageError x) {
+            reportErrors(l, item, x);
         }
     }
 
@@ -309,24 +293,74 @@ public class TickerTask implements Runnable {
             return;
         }
 
+        if (tickFreezePredicate.test(entry)) {
+            waiting.addFirst(entry);
+            tickFreeze = true;
+            return;
+        }
+
         if (entry.isSync()) {
-            /**
-             * We are inserting a new timestamp because synchronized actions
-             * are always ran with a 50ms delay (1 game tick)
-             */
-            Slimefun.runSync(() -> {
-                ASlimefunDataContainer blockData = entry.getData();
-                if (blockData.isPendingRemove()) {
-                    return;
-                }
-                timedTickBlock(entry);
-            });
+            Slimefun.runSync(() -> timedTickBlock(entry));
         } else {
             timedTickBlock(entry);
         }
     }
 
+    /**
+     * 执行堆积 waiting 的全部 tick 任务
+     */
+    private void flushWaitingEntries() {
+        while (!waiting.isEmpty() && !tickFreeze) {
+            timedTickBlock();
+        }
+    }
+
+    /**
+     * {@link ClickEvent#callback} 会运行在主线程上，步过/运行到 操作可能导致阻塞主线程
+     * 使用 {@code operateExecutor} 避免阻塞主线程
+     */
+    private void stepTo(WaitingEntry target, boolean inclusive) {
+        // 防抖：禁止两段步进同时跑
+        if (!stepping.compareAndSet(false, true)) {
+            return;
+        }
+
+        try {
+            operateExecutor.execute(() -> {
+                try {
+                    while (!tickFreeze) {
+                        WaitingEntry head = waiting.peek();
+
+                        // 队列已空，或者队首已经越过目标（被别的线程推进过），就收手
+                        if (head == null || (inclusive ? head.id > target.id : head.id >= target.id)) {
+                            break;
+                        }
+
+                        timedTickBlock();
+                    }
+                } finally {
+                    stepping.set(false);
+                    showWaitingList();
+                }
+            });
+        } catch (RejectedExecutionException x) {
+            stepping.set(false);
+            Slimefun.logger().log(Level.SEVERE, x, () -> "Operate Executor 不可用，无法步进");
+        }
+    }
+
+    private int clearWaitingEntries() {
+        int discarded = waiting.size();
+        waiting.clear();
+        return discarded;
+    }
+
     private void timedTickBlock(WaitingEntry entry) {
+        if (entry.isSync()) {
+            Slimefun.getProfiler().scheduleEntries(1);
+        } else {
+            Slimefun.getProfiler().newEntry();
+        }
         timedTickBlock(entry, 10, TimeUnit.SECONDS); // default timeout
     }
 
@@ -354,9 +388,11 @@ public class TickerTask implements Runnable {
     @ParametersAreNonnullByDefault
     private void timedTickBlock(WaitingEntry entry, long timeout, TimeUnit timeUnit) {
         if (entry.data.isPendingRemove()) return; // waiting 期间机器可能会被拆除
+
         Location l = entry.location;
         SlimefunItem item = entry.item;
-        long timestamp = entry.timestamp;
+        long timestamp = System.nanoTime();
+
         try {
             if (entry.isSync()) {
                 // Bukkit 自带的 Watchdog 会检测超时，不需要我们处理
@@ -424,21 +460,8 @@ public class TickerTask implements Runnable {
         }
     }
 
-    public boolean isHalted() {
-        return halted;
-    }
-
     public void halt() {
         halted = true;
-    }
-
-    /**
-     * This returns the delay between ticks
-     *
-     * @return The tick delay
-     */
-    public int getTickRate() {
-        return tickRate;
     }
 
     /**
@@ -588,7 +611,16 @@ public class TickerTask implements Runnable {
         Validate.notNull(uuid, "Universal Data ID cannot be null!");
 
         synchronized (tickingLocations) {
-            tickingLocations.values().forEach(loc -> loc.removeIf(tk -> uuid.equals(tk.getUuid())));
+            // 顺手清掉被搬空的 Set
+            var iterator = tickingLocations.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<ChunkPosition, Set<TickLocation>> entry = iterator.next();
+                entry.getValue().removeIf(tk -> uuid.equals(tk.getUuid()));
+
+                if (entry.getValue().isEmpty()) {
+                    iterator.remove();
+                }
+            }
         }
     }
 
@@ -608,31 +640,16 @@ public class TickerTask implements Runnable {
             int number = (page - 1) * PAGE_SIZE + j + 1;
             String head = number + ". " + entry.item.getItemName() + " ";
             builder.color(TextColor.color(0x00B7B7))
-                    .append(Component.text()
-                            .append(Component.text(head))
-                            .hoverEvent(Component.text("点击步过").clickEvent(ClickEvent.callback(p2 -> {
-                                while (!waiting.isEmpty() && waiting.peek().id <= entry.id) {
-                                    timedTickBlock();
-                                }
-                                showWaitingList();
-                            }))))
+                    .append(Component.text(head)
+                            .hoverEvent(
+                                    Component.text("点击步过").clickEvent(ClickEvent.callback(p2 -> stepTo(entry, true)))))
                     .append(Component.text(" ".repeat(Math.max(0, 12 - head.length()))))
                     .append(Component.text("[运行到] ")
                             .hoverEvent(Component.text("点击运行到此并停止"))
-                            .clickEvent(ClickEvent.callback(p2 -> {
-                                while (!waiting.isEmpty() && waiting.peek().id < entry.id) {
-                                    timedTickBlock();
-                                }
-                                showWaitingList();
-                            })))
+                            .clickEvent(ClickEvent.callback(p2 -> stepTo(entry, false))))
                     .append(Component.text("[步过] ")
                             .hoverEvent(Component.text("点击步过"))
-                            .clickEvent(ClickEvent.callback(p2 -> {
-                                while (!waiting.isEmpty() && waiting.peek().id <= entry.id) {
-                                    timedTickBlock();
-                                }
-                                showWaitingList();
-                            })))
+                            .clickEvent(ClickEvent.callback(p2 -> stepTo(entry, true))))
                     .append(Component.text("[高亮] ")
                             .hoverEvent(Component.text("点击高亮方块"))
                             .clickEvent(ClickEvent.callback(p2 -> {
