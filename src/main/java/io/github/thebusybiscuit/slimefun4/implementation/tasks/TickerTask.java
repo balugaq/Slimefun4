@@ -290,13 +290,13 @@ public class TickerTask implements Runnable {
         }
     }
 
-    private void timedTickBlock() {
-        WaitingEntry entry = waiting.poll();
-        if (entry == null) {
-            return;
-        }
+    private void timedTickBlock(boolean checkTickFreeze) {
+        if (checkTickFreeze && tickFreeze) return;
 
-        if (tickFreezePredicate.test(entry)) {
+        WaitingEntry entry = waiting.poll();
+        if (entry == null) return;
+
+        if (checkTickFreeze && tickFreezePredicate.test(entry)) {
             waiting.addFirst(entry);
             tickFreeze = true;
             return;
@@ -314,7 +314,7 @@ public class TickerTask implements Runnable {
      */
     private void flushWaitingEntries() {
         while (!waiting.isEmpty() && !tickFreeze) {
-            timedTickBlock();
+            timedTickBlock(true);
         }
     }
 
@@ -339,7 +339,7 @@ public class TickerTask implements Runnable {
                             break;
                         }
 
-                        timedTickBlock();
+                        timedTickBlock(false);
                     }
                 } finally {
                     stepping.set(false);
