@@ -42,7 +42,6 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.TextColor;
 import org.apache.commons.lang.Validate;
-import org.apache.commons.lang.time.StopWatch;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Location;
@@ -331,7 +330,7 @@ public class TickerTask implements Runnable {
         try {
             operateExecutor.execute(() -> {
                 try {
-                    while (!tickFreeze) {
+                    while (true) {
                         WaitingEntry head = waiting.peek();
 
                         // 队列已空，或者队首已经越过目标（被别的线程推进过），就收手
