@@ -301,11 +301,7 @@ public class TickerTask implements Runnable {
             return;
         }
 
-        if (entry.isSync()) {
-            Slimefun.runSync(() -> timedTickBlock(entry));
-        } else {
-            timedTickBlock(entry);
-        }
+        timedTickBlock(entry);
     }
 
     /**
@@ -360,10 +356,11 @@ public class TickerTask implements Runnable {
     private void timedTickBlock(WaitingEntry entry) {
         if (entry.isSync()) {
             Slimefun.getProfiler().scheduleEntries(1);
+            Slimefun.runSync(() -> timedTickBlock(entry, 10, TimeUnit.SECONDS));
         } else {
             Slimefun.getProfiler().newEntry();
+            timedTickBlock(entry, 10, TimeUnit.SECONDS); // default timeout
         }
-        timedTickBlock(entry, 10, TimeUnit.SECONDS); // default timeout
     }
 
     @Internal
