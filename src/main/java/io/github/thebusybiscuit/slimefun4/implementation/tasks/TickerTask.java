@@ -194,7 +194,7 @@ public class TickerTask implements Runnable {
                 }
 
                 for (Map.Entry<ChunkPosition, Set<TickLocation>> entry : loc) {
-                    // 将所有机器添加到 waiting queue 中
+                    // 将所有机器添加到 waiting queue 中，在这里会检查 tickFreeze
                     tickChunk(entry.getKey(), tickers, new HashSet<>(entry.getValue()));
                 }
             }
@@ -353,13 +353,28 @@ public class TickerTask implements Runnable {
         return discarded;
     }
 
+    /**
+     * 无论是否 tickFreeze，都会调用到此方法
+     */
     private void timedTickBlock(WaitingEntry entry) {
-        if (entry.isSync()) {
-            Slimefun.getProfiler().scheduleEntries(1);
-            Slimefun.runSync(() -> timedTickBlock(entry, 10, TimeUnit.SECONDS));
-        } else {
-            Slimefun.getProfiler().newEntry();
-            timedTickBlock(entry, 10, TimeUnit.SECONDS); // default timeout
+        var timestamp = System.nanoTime();
+        try {
+            if (entry.isSync()) {
+                // tickFreeze 时不进行统计
+                if (!tickFreeze) {
+                    Slimefun.getProfiler().scheduleEntries(1);
+                }
+                Slimefun.runSync(() -> timedTickBlock(entry, 10, TimeUnit.SECONDS));
+            } else {
+                if (!tickFreeze) {
+                    Slimefun.getProfiler().newEntry();
+                }
+                timedTickBlock(entry, 10, TimeUnit.SECONDS); // default timeout
+            }
+        } finally {
+            if (!tickFreeze) {
+                Slimefun.getProfiler().closeEntry(entry.location, entry.item, timestamp);
+            }
         }
     }
 
@@ -390,7 +405,6 @@ public class TickerTask implements Runnable {
 
         Location l = entry.location;
         SlimefunItem item = entry.item;
-        long timestamp = System.nanoTime();
 
         try {
             if (entry.isSync()) {
@@ -408,8 +422,6 @@ public class TickerTask implements Runnable {
             reportTimeout(l, item, timeout, timeUnit, e);
         } catch (Exception | LinkageError x) {
             reportErrors(l, item, x);
-        } finally {
-            Slimefun.getProfiler().closeEntry(l, item, timestamp);
         }
     }
 
