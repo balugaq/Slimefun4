@@ -173,15 +173,15 @@ public class TickerTask implements Runnable {
         }
         count = 0;
 
-        flushWaitingEntries(); // 上轮 tick freeze 没执行的
+        // If this method is actually still running... DON'T
+        if (running) {
+            return;
+        }
+
+        running = true;
 
         try {
-            // If this method is actually still running... DON'T
-            if (running) {
-                return;
-            }
-
-            running = true;
+            flushWaitingEntries(); // 上轮 tick freeze 没执行的
             Slimefun.getProfiler().start();
             Set<BlockTicker> tickers = new HashSet<>();
 
