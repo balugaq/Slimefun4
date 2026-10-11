@@ -369,14 +369,10 @@ public class TickerTask implements Runnable {
         SlimefunItem item = entry.item;
 
         if (entry.isSync()) {
+            Slimefun.getProfiler().scheduleEntries(1);
             Slimefun.runSync(() -> {
-                long timestamp = 0;
+                long timestamp = profiling ? System.nanoTime() : 0;
                 try {
-                    if (profiling) {
-                        Slimefun.getProfiler().scheduleEntries(1);
-                        timestamp = System.nanoTime();
-                    }
-
                     // Bukkit 自带的 Watchdog 会检测超时，不需要我们处理
                     tickBlock(entry);
                 } catch (Exception | LinkageError x) {
